@@ -433,6 +433,156 @@ class TestDetectTrackingLeaksUnreadable:
         assert [leak["cue_to"] for leak in data["leaks"]] == ["3"]
 
 
+class TestCueRefFormatting:
+    """Whole cue numbers must not acquire the ".0" that float() adds."""
+
+    def test_int_stays_int(self):
+        from src.mcp_tools.analysis import _cue_ref
+
+        assert _cue_ref(3) == "3"
+
+    def test_float_that_is_whole_loses_the_decimal(self):
+        from src.mcp_tools.analysis import _cue_ref
+
+        assert _cue_ref(3.0) == "3"
+        assert _cue_ref(12.0) == "12"
+
+    def test_sub_cue_keeps_its_decimal(self):
+        from src.mcp_tools.analysis import _cue_ref
+
+        assert _cue_ref(1.1) == "1.1"
+
+    def test_accepts_a_string_as_given(self):
+        from src.mcp_tools.analysis import _cue_ref
+
+        assert _cue_ref("1.1") == "1.1"
+        assert _cue_ref("7") == "7"
+
+
+class TestReplyLineFilters:
+    def test_command_echo_is_not_cue_data(self):
+        from src.mcp_tools.analysis import _ECHO_LINE_RE
+
+        assert _ECHO_LINE_RE.match("Executing : List cue 3 sequence 1")
+        assert _ECHO_LINE_RE.match("NO OBJECTS FOUND")
+
+    def test_real_cue_data_survives(self):
+        from src.mcp_tools.analysis import _ECHO_LINE_RE
+
+        assert not _ECHO_LINE_RE.match("Dimmer 100")
+        assert not _ECHO_LINE_RE.match("  Dimmer 50")
+        assert not _ECHO_LINE_RE.match("Pan 128")
+
+    def test_prompt_lines_are_recognised(self):
+        from src.mcp_tools.analysis import _is_prompt_line
+
+        assert _is_prompt_line("[Fixture]>") is True
+        assert _is_prompt_line("[Channel]>") is True
+        assert _is_prompt_line("Macro>") is True
+
+    def test_data_is_not_mistaken_for_a_prompt(self):
+        from src.mcp_tools.analysis import _is_prompt_line
+
+        assert _is_prompt_line("Dimmer 100") is False
+
+
+class TestDiffCuesMissingCues:
+    """Two cues that do not exist are not two identical cues."""
+
+    NOT_FOUND = "Executing : List cue 3 sequence 1\n\r\r NO OBJECTS FOUND\n\r\r [Fixture]>"
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_both_missing_is_not_reported_as_identical(self, mock_get_client):
+        from src.server import diff_cues
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(return_value=self.NOT_FOUND)
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await diff_cues(sequence_id=1, cue_a=3, cue_b=3))
+
+        assert data["comparable"] is False
+        assert data["identical"] is None
+        assert sorted(data["cues_not_found"]) == ["3", "3"]
+        assert "nothing to compare" in data["error"]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_one_missing_is_reported_and_the_other_is_named(self, mock_get_client):
+        from src.server import diff_cues
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "Dimmer=100\n",
+            self.NOT_FOUND,
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await diff_cues(sequence_id=1, cue_a=1, cue_b=9))
+
+        assert data["comparable"] is False
+        assert data["cues_not_found"] == ["9"]
+        assert "list_sequence_cues" in data["hint"]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_command_never_carries_a_decimal_for_a_whole_cue(self, mock_get_client):
+        from src.server import diff_cues
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "Dimmer=100\n", "Dimmer=50\n",
+        ])
+        mock_get_client.return_value = mock_client
+
+        await diff_cues(sequence_id=156, cue_a=3.0, cue_b=4.0)
+
+        asked = [c.args[0] for c in mock_client.send_command_with_response.call_args_list]
+        assert asked == [
+            "list cue 3 sequence 156",
+            "list cue 4 sequence 156",
+        ]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_command_echo_is_not_parsed_as_an_attribute(self, mock_get_client):
+        from src.server import diff_cues
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "Executing : List cue 1 sequence 1\n\r\rDimmer=100 Color=Red\n\r\r [Fixture]>",
+            "Executing : List cue 2 sequence 1\n\r\rDimmer=100 Color=Blue\n\r\r [Fixture]>",
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await diff_cues(sequence_id=1, cue_a=1, cue_b=2))
+
+        changed = {c["attribute"] for c in data["changes"]}
+        assert "Executing" not in changed, changed
+        assert "NO" not in changed, changed
+        # the real difference is still found
+        assert "Color" in changed, changed
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_two_real_cues_still_compare(self, mock_get_client):
+        from src.server import diff_cues
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "Dimmer=100 Color=Red\n\r\r [Fixture]>",
+            "Dimmer=50 Color=Blue\n\r\r [Fixture]>",
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await diff_cues(sequence_id=1, cue_a=1, cue_b=2))
+
+        assert data["comparable"] is True
+        assert data["identical"] is False
+        assert data["total_changes"] > 0
+
+
 class TestAuditPageConsistency:
     @pytest.mark.asyncio
     @patch("src.server.get_page_map")

@@ -43,6 +43,43 @@ def _cue_ids_from_listing(raw: str, limit: int) -> list[str]:
     return list(seen)
 
 
+def _cue_not_found(raw: str) -> bool:
+    """True when the console had nothing for the cue that was asked for."""
+    return "NO OBJECTS" in raw.upper()
+
+
+def _cue_ref(value: int | float | str) -> str:
+    """A cue number as grandMA2 spells it.
+
+    Accepts the float that several tool signatures use so sub-cue numbers keep
+    their decimal (1.1) while whole cues lose the ".0" that float() adds.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        number = float(value)
+        text = str(int(number)) if number.is_integer() else f"{number:g}"
+    return text or "1"
+
+
+# Lines the console emits around the reply that are not cue data: the echo of
+# our own command, the "NO OBJECTS FOUND" refusal, and errors. Parsing these
+# as attributes invents fields ("Executing", "NO") that look like real data.
+_ECHO_LINE_RE = re.compile(r"^\s*(Executing|No objects\b|error\b|Error\b)", re.IGNORECASE)
+
+# The console prompt the reply ends with, e.g. "[Fixture]>" or "[Channel]>".
+_PROMPT_ONLY_RE = re.compile(r"^\s*[\[\w][^\r\n]*>\s*$")
+
+
+def _is_prompt_line(line: str) -> bool:
+    """True for a line that is only the console's prompt.
+
+    Kept local rather than imported: this module is imported *by* src.server,
+    so pulling in src.telnet_client at module level would close an import cycle.
+    """
+    return bool(_PROMPT_ONLY_RE.match(line))
+
+
 # ============================================================
 # Analysis & Intelligence Tools
 # Impact analysis, dependency mapping, linting, and recovery
@@ -161,23 +198,56 @@ async def diff_cues(
 
     Returns:
         str: JSON with changes[], timing_diff, label_diff, block_diff, identical.
+        When either cue cannot be read, the result carries comparable=false and
+        names the cues that are missing rather than reporting a diff of
+        nothing.
     """
     client = await _srv.get_client()
-    raw_a = await client.send_command_with_response(f"list cue {cue_a} sequence {sequence_id}")
-    raw_b = await client.send_command_with_response(f"list cue {cue_b} sequence {sequence_id}")
+    ref_a, ref_b = _cue_ref(cue_a), _cue_ref(cue_b)
+    raw_a = await client.send_command_with_response(f"list cue {ref_a} sequence {sequence_id}")
+    raw_b = await client.send_command_with_response(f"list cue {ref_b} sequence {sequence_id}")
+
+    missing: list[str] = []
+    if _cue_not_found(raw_a):
+        missing.append(ref_a)
+    if _cue_not_found(raw_b):
+        missing.append(ref_b)
+    if missing:
+        return json.dumps({
+            "sequence_id": sequence_id,
+            "cue_a": ref_a,
+            "cue_b": ref_b,
+            "comparable": False,
+            "cues_not_found": missing,
+            "error": (
+                f"Cue(s) {', '.join(missing)} not found in sequence {sequence_id}; "
+                "there is nothing to compare."
+            ),
+            "hint": "Use list_sequence_cues(sequence_id) to see the available cues.",
+            "identical": None,
+            "total_changes": None,
+            "changes": [],
+            "risk_tier": "SAFE_READ",
+        }, indent=2)
 
     def _parse_cue_attrs(raw: str) -> dict[str, str]:
-        """Parse attribute=value pairs from cue listing."""
+        """Parse attribute=value pairs from cue listing.
+
+        Skips the console's own lines (the command echo, refusal, errors):
+        read as a column they would invent attributes called "Executing".
+        """
         attrs: dict[str, str] = {}
         for line in raw.strip().splitlines():
             line = line.strip()
+            if not line or _ECHO_LINE_RE.match(line):
+                continue
             # Try KEY=VALUE or tabular format
             kv = re.findall(r"(\w+)\s*=\s*(\S+)", line)
             for k, v in kv:
                 attrs[k] = v
             # Also capture column-based data (Name Value pairs)
             cols = line.split()
-            if len(cols) >= 2 and not line.startswith("#"):
+            if len(cols) >= 2:
                 attrs[cols[0]] = " ".join(cols[1:])
         return attrs
 
@@ -210,14 +280,23 @@ async def diff_cues(
     block_a = "block" in raw_a.lower()
     block_b = "block" in raw_b.lower()
 
-    # Fallback raw diff
-    lines_a = set(raw_a.strip().splitlines())
-    lines_b = set(raw_b.strip().splitlines())
+    # Fallback raw diff, from the cue data only — the command echo and the
+    # prompt differ between two reads of the same cue and would show up here.
+    def _data_lines(raw: str) -> set[str]:
+        return {
+            ln.strip() for ln in raw.strip().splitlines()
+            if ln.strip() and not _ECHO_LINE_RE.match(ln.strip())
+            and not _is_prompt_line(ln.strip())
+        }
+
+    lines_a = _data_lines(raw_a)
+    lines_b = _data_lines(raw_b)
 
     return json.dumps({
         "sequence_id": sequence_id,
-        "cue_a": cue_a,
-        "cue_b": cue_b,
+        "cue_a": ref_a,
+        "cue_b": ref_b,
+        "comparable": True,
         "changes": changes,
         "total_changes": len(changes),
         "timing_diff": timing_diff,
