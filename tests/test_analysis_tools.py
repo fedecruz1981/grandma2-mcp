@@ -263,6 +263,176 @@ class TestDetectTrackingLeaks:
         assert "error" in data
 
 
+class TestCueIdsFromListing:
+    """Cue numbers must keep the spelling grandMA2 uses.
+
+    Parse them into a float and interpolate back, and cue 3 becomes
+    "list cue 3.0 sequence N" — a cue that does not exist.
+    """
+
+    def test_keeps_integers_without_a_decimal(self):
+        from src.mcp_tools.analysis import _cue_ids_from_listing
+
+        assert _cue_ids_from_listing("1  A\n2  B\n3  C\n", 10) == ["1", "2", "3"]
+
+    def test_no_float_ever_appears_in_the_listing(self):
+        from src.mcp_tools.analysis import _cue_ids_from_listing
+
+        ids = _cue_ids_from_listing("1  A\n2  B\n3  C\n4  D\n", 10)
+        assert not any("." in i for i in ids), ids
+
+    def test_keeps_sub_cues_as_the_console_spells_them(self):
+        from src.mcp_tools.analysis import _cue_ids_from_listing
+
+        assert _cue_ids_from_listing("1  A\n1.1  B\n2  C\n", 10) == ["1", "1.1", "2"]
+
+    def test_respects_the_limit(self):
+        from src.mcp_tools.analysis import _cue_ids_from_listing
+
+        assert _cue_ids_from_listing("1 A\n2 B\n3 C\n4 D\n", 2) == ["1", "2"]
+
+    def test_deduplicates(self):
+        from src.mcp_tools.analysis import _cue_ids_from_listing
+
+        assert _cue_ids_from_listing("1 A\n1 A again\n2 B\n", 10) == ["1", "2"]
+
+    def test_empty_listing(self):
+        from src.mcp_tools.analysis import _cue_ids_from_listing
+
+        assert _cue_ids_from_listing("NO OBJECTS FOUND", 10) == []
+
+
+class TestDetectTrackingLeaksCueNumbers:
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_asks_the_console_for_whole_cue_numbers(self, mock_get_client):
+        from src.server import detect_tracking_leaks
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1  Cue1\n2  Cue2\n",
+            "Dimmer 1 a\n",
+            "Dimmer 2 b\n",
+        ])
+        mock_get_client.return_value = mock_client
+
+        await detect_tracking_leaks(sequence_id=1)
+
+        asked = [c.args[0] for c in mock_client.send_command_with_response.call_args_list]
+        assert asked == [
+            "list cue sequence 1",
+            "list cue 1 sequence 1",
+            "list cue 2 sequence 1",
+        ]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_no_cue_number_is_ever_asked_with_a_decimal(self, mock_get_client):
+        from src.server import detect_tracking_leaks
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1  Cue1\n2  Cue2\n3  Cue3\n",
+            "Dimmer 1 a\n", "Dimmer 2 b\n", "Dimmer 3 c\n",
+        ])
+        mock_get_client.return_value = mock_client
+
+        await detect_tracking_leaks(sequence_id=1)
+
+        for call in mock_client.send_command_with_response.call_args_list:
+            cmd = call.args[0]
+            if "list cue " in cmd and "sequence" in cmd:
+                number = cmd.split("list cue ")[1].split(" sequence")[0]
+                assert number == number.rstrip("0").rstrip("."), cmd
+
+
+class TestDetectTrackingLeaksUnreadable:
+    """A cue the console cannot name must not be reported as "clean"."""
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_unreadable_cue_is_listed_and_report_is_marked_incomplete(self, mock_get_client):
+        from src.server import detect_tracking_leaks
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1  Cue1\n2  Cue2\n",          # cue list
+            "Dimmer 100 a\n",               # cue 1, fine
+            "NO OBJECTS FOUND",             # cue 2, unreadable
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await detect_tracking_leaks(sequence_id=1))
+
+        assert data["cues_unreadable"] == [{"cue_id": "2"}]
+        assert data["complete"] is False
+        assert "could not be read" in data["recommendation"]
+        # "no leaks" must not be claimed for the pair that never got read
+        assert "says nothing about the unread" in data["recommendation"]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_no_leaks_when_every_cue_answered(self, mock_get_client):
+        from src.server import detect_tracking_leaks
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1  Cue1\n2  Cue2\n",
+            "Dimmer 100 a\n",
+            "Dimmer 200 b\n",
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await detect_tracking_leaks(sequence_id=1))
+
+        assert data["complete"] is True
+        assert data["cues_unreadable"] == []
+        assert data["recommendation"] == "No tracking leaks detected."
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_leaks_between_two_readable_cues_are_still_found(self, mock_get_client):
+        from src.server import detect_tracking_leaks
+
+        shared = "Dimmer 100 attr data"
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1  Cue1\n2  Cue2\n3  Cue3\n",
+            f"{shared}\nColor Red\n",
+            f"{shared}\nColor Blue\n",   # cue 1→2: leak
+            "NO OBJECTS FOUND",          # cue 3 unreadable
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await detect_tracking_leaks(sequence_id=1))
+
+        assert data["total_leaks"] >= 1
+        assert data["cues_unreadable"] == [{"cue_id": "3"}]
+        assert data["complete"] is False
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_pair_after_an_unreadable_cue_is_not_compared(self, mock_get_client):
+        from src.server import detect_tracking_leaks
+
+        # Cues 2 and 3 are identical. 1 is unreadable, so 2 has no partner;
+        # 3 is readable and 2 is readable, so 2→3 is a real pair.
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1  Cue1\n2  Cue2\n3  Cue3\n",
+            "NO OBJECTS FOUND",
+            "Dimmer 100 shared\n",
+            "Dimmer 100 shared\n",
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await detect_tracking_leaks(sequence_id=1))
+
+        assert data["cues_unreadable"] == [{"cue_id": "1"}]
+        assert [leak["cue_from"] for leak in data["leaks"]] == ["2"]
+        assert [leak["cue_to"] for leak in data["leaks"]] == ["3"]
+
+
 class TestAuditPageConsistency:
     @pytest.mark.asyncio
     @patch("src.server.get_page_map")

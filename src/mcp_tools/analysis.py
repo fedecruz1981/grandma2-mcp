@@ -22,6 +22,27 @@ from src.server import (
     mcp,
 )
 
+# A cue number as grandMA2 writes it: "3" or "3.1", never "3.0". Parsing these
+# into a float and interpolating it back turns cue 3 into "list cue 3.0
+# sequence N", which names no cue; the console answers NO OBJECTS FOUND and the
+# caller reads that as "nothing to report" instead of "could not read".
+_CUE_ID_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s", re.MULTILINE)
+
+
+def _cue_ids_from_listing(raw: str, limit: int) -> list[str]:
+    """Cue numbers from a `list cue sequence N` reply, as the console spells them.
+
+    Deduplicated in first-seen order so a listing that repeats a cue does not
+    make us read the same cue twice.
+    """
+    seen: dict[str, None] = {}
+    for m in _CUE_ID_RE.finditer(raw):
+        seen.setdefault(m.group(1), None)
+        if len(seen) >= limit:
+            break
+    return list(seen)
+
+
 # ============================================================
 # Analysis & Intelligence Tools
 # Impact analysis, dependency mapping, linting, and recovery
@@ -555,11 +576,7 @@ async def detect_tracking_leaks(
     if "NO OBJECTS" in raw.upper():
         return json.dumps({"error": f"Sequence {sequence_id} not found.", "risk_tier": "SAFE_READ"}, indent=2)
 
-    cue_ids: list[float] = []
-    for m in re.finditer(r"^\s*(\d+(?:\.\d+)?)\s", raw, re.MULTILINE):
-        cue_ids.append(float(m.group(1)))
-        if len(cue_ids) >= max_cues:
-            break
+    cue_ids: list[str] = _cue_ids_from_listing(raw, max_cues)
 
     if len(cue_ids) < 2:
         return json.dumps({
@@ -573,43 +590,76 @@ async def detect_tracking_leaks(
 
     # Compare adjacent cue pairs
     leaks: list[dict] = []
+    unreadable: list[dict] = []
+
+    def _readable(text: str) -> bool:
+        """False when the console had nothing for that cue.
+
+        An unreadable cue must not be compared: intersecting its "NO OBJECTS
+        FOUND" against the previous cue finds nothing, which reads as a clean
+        pair instead of a missing reading.
+        """
+        return "NO OBJECTS" not in text.upper()
+
     prev_raw = await client.send_command_with_response(f"list cue {cue_ids[0]} sequence {sequence_id}")
+    prev_ok = _readable(prev_raw)
+    if not prev_ok:
+        unreadable.append({"cue_id": cue_ids[0]})
 
     for i in range(1, len(cue_ids)):
         curr_raw = await client.send_command_with_response(f"list cue {cue_ids[i]} sequence {sequence_id}")
+        curr_ok = _readable(curr_raw)
+        if not curr_ok:
+            unreadable.append({"cue_id": cue_ids[i]})
 
-        # Find values present in both that aren't explicitly blocked
-        prev_vals = set(prev_raw.strip().splitlines())
-        curr_vals = set(curr_raw.strip().splitlines())
-        shared = prev_vals & curr_vals
+        # A pair only counts when both sides answered. When the previous cue
+        # could not be read, this one has no partner to compare against.
+        if prev_ok and curr_ok:
+            prev_vals = set(prev_raw.strip().splitlines())
+            curr_vals = set(curr_raw.strip().splitlines())
+            shared = prev_vals & curr_vals
 
-        # Lines that appear identical in both cues AND contain attribute data
-        for line in shared:
-            line = line.strip()
-            if re.match(r"^\s*\w+\s+\d", line) and "block" not in line.lower():
-                attr_match = re.match(r"^\s*(\w+)", line)
-                if attr_match:
-                    leaks.append({
-                        "cue_from": cue_ids[i - 1],
-                        "cue_to": cue_ids[i],
-                        "attribute": attr_match.group(1),
-                        "value": line.strip()[:100],
-                        "note": "Value identical in adjacent cues — may be tracking forward without explicit set",
-                    })
+            # Lines that appear identical in both cues AND contain attribute data
+            for line in shared:
+                line = line.strip()
+                if re.match(r"^\s*\w+\s+\d", line) and "block" not in line.lower():
+                    attr_match = re.match(r"^\s*(\w+)", line)
+                    if attr_match:
+                        leaks.append({
+                            "cue_from": cue_ids[i - 1],
+                            "cue_to": cue_ids[i],
+                            "attribute": attr_match.group(1),
+                            "value": line.strip()[:100],
+                            "note": "Value identical in adjacent cues — may be tracking forward without explicit set",
+                        })
 
-        prev_raw = curr_raw
+        prev_raw, prev_ok = curr_raw, curr_ok
         await asyncio.sleep(0.05)
 
-    rec = "No tracking leaks detected." if not leaks else (
-        f"Found {len(leaks)} potential tracking leak(s). "
-        "Use Block on cues where values should stop tracking forward."
-    )
+    unreadable_ids = ", ".join(str(c["cue_id"]) for c in unreadable)
+    if unreadable:
+        rec = (
+            f"{len(unreadable)} of {len(cue_ids)} cue(s) could not be read "
+            f"({unreadable_ids}); the leaks below cover only the pairs where "
+            "both cues answered, so 'no leaks' says nothing about the unread ones."
+        )
+        if leaks:
+            rec += f" Found {len(leaks)} potential tracking leak(s) in the readable pairs."
+    elif leaks:
+        rec = (
+            f"Found {len(leaks)} potential tracking leak(s). "
+            "Use Block on cues where values should stop tracking forward."
+        )
+    else:
+        rec = "No tracking leaks detected."
 
     return json.dumps({
         "sequence_id": sequence_id,
         "leaks": leaks[:50],
         "total_leaks": len(leaks),
         "cues_checked": len(cue_ids),
+        "cues_unreadable": unreadable,
+        "complete": not unreadable,
         "recommendation": rec,
         "risk_tier": "SAFE_READ",
     }, indent=2)
@@ -953,11 +1003,7 @@ async def trace_attribute_lineage(
     candidate_sources: list[dict] = []
     for seq_id in sequence_ids:
         cue_list = await client.send_command_with_response(f"list cue sequence {seq_id}")
-        cue_ids: list[str] = []
-        for match in re.finditer(r"^\s*(\d+(?:\.\d+)?)\s", cue_list, re.MULTILINE):
-            cue_ids.append(match.group(1))
-            if len(cue_ids) >= max_cues_per_sequence:
-                break
+        cue_ids: list[str] = _cue_ids_from_listing(cue_list, max_cues_per_sequence)
 
         for cue_id in cue_ids:
             cue_raw = await client.send_command_with_response(f"list cue {cue_id} sequence {seq_id}")
