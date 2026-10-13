@@ -57,6 +57,86 @@ class TestDroppedConnection:
             await _send(client)
 
 
+class TestEchoMismatch:
+    """The console echoed something other than what we sent.
+
+    A malformed command does not fail: the console answers whatever it made of
+    the line, and the reply reads like a real answer to the wrong question.
+    """
+
+    def _echo(self, keyword: str) -> str:
+        return f"Executing : \x1b[32m{keyword}\x1b[37m 1\n\r\r [Fixture]>\x1b[K"
+
+    @pytest.mark.asyncio
+    async def test_matching_echo_does_not_warn(self):
+        client = _client([TimeoutError(), self._echo("List") + "\r\nCue 1\r\n[Channel]>", TimeoutError()])
+        with collect_transport_warnings() as warnings:
+            await _send(client, "list cue")
+        assert warnings == []
+
+    @pytest.mark.asyncio
+    async def test_reply_without_any_echo_does_not_warn(self):
+        # Plenty of MA2 keywords answer with no Executing marker at all.
+        client = _client([TimeoutError(), "Cue 1\r\n[Channel]>", TimeoutError()])
+        with collect_transport_warnings() as warnings:
+            await _send(client, "list cue")
+        assert warnings == []
+
+    @pytest.mark.asyncio
+    async def test_echo_of_another_keyword_warns(self):
+        # We asked to "list", the console echoed "Store": it read the line as
+        # something else, so the body we got back answers another question.
+        client = _client([TimeoutError(), self._echo("Store") + "\r\nCue 1\r\n[Channel]>", TimeoutError()])
+        with collect_transport_warnings() as warnings:
+            await _send(client, "list cue")
+        assert any("did not echo" in w and "list" in w for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_stale_echo_of_another_session_does_not_warn(self):
+        # Another session's echo names another keyword; ours is missing. The
+        # mismatch is real, but it is the stale line we want to report on, not
+        # this tool call — still worth saying so, since our own reply is absent.
+        stale = "Executing : \x1b[32mStore\x1b[37m Sequence 136\n\r\r [Fixture]>\x1b[K"
+        client = _client([TimeoutError(), stale + "\r\nCue 1\r\n[Channel]>", TimeoutError()])
+        with collect_transport_warnings() as warnings:
+            raw = await _send(client, "list cue")
+        assert raw.startswith(stale)
+        assert any("did not echo" in w for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_abbreviated_keyword_counts_as_ours(self):
+        # We send "cd", the console echoes the canonical "ChangeDest".
+        client = _client([
+            TimeoutError(),
+            "Executing : \x1b[32mChangeDest\x1b[37m / 3\r\n\r [Fixture]>\x1b[K",
+            TimeoutError(),
+        ])
+        with collect_transport_warnings() as warnings:
+            await _send(client, "cd / 3")
+        assert warnings == []
+
+
+class TestEchoMatchesCommandUnit:
+    """The predicate itself, without the socket."""
+
+    def test_no_command_is_not_a_mismatch(self):
+        from src.telnet_client import echo_matches_command
+
+        assert echo_matches_command("Executing : List 1", "") is True
+
+    def test_other_session_echo_alongside_ours_is_a_match(self):
+        from src.telnet_client import echo_matches_command
+
+        raw = "Executing : Store 1\n\r\r [Fixture]>\r\rExecuting : List 1\n\r\rCue 1\r\r [Channel]>"
+        assert echo_matches_command(raw, "list cue") is True
+
+    def test_only_our_own_echo_is_required(self):
+        from src.telnet_client import echo_matches_command
+
+        raw = "Executing : Goto cue 3 sequence 156\n\r\r [Fixture]>\x1b[K"
+        assert echo_matches_command(raw, "list cue") is False
+
+
 class TestCutOffReplies:
     @pytest.mark.asyncio
     async def test_complete_reply_has_no_warning(self):

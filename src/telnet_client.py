@@ -94,6 +94,35 @@ def _vocab_spec():
     return build_v39_spec()
 
 
+def _echo_start(raw: str, wanted: frozenset[str]) -> int | None:
+    """Where the console's echo naming one of *wanted* starts, or ``None``."""
+    for marker in _ECHO_MARKER_RE.finditer(raw):
+        line_end = raw.find("\n", marker.end())
+        echoed = _ANSI_RE.sub("", raw[marker.end(): line_end if line_end != -1 else None])
+        m = _ECHO_KEYWORD_RE.match(echoed)
+        if m and m.group(1).lower() in wanted:
+            return marker.start()
+    return None
+
+
+def echo_matches_command(raw: str, command: str) -> bool:
+    """True when the reply echoes *command*'s keyword, or echoes nothing at all.
+
+    Plenty of MA2 keywords answer without an ``Executing`` marker, so a reply
+    with no marker is not a fault. The interesting case is the opposite: the
+    console echoed *something* and it did not name the keyword that was sent.
+    That means the console read the command as something else — a wrong
+    separator, a wrong keyword — and the reply on hand answers a different
+    question than the one that was asked.
+    """
+    tokens = command.split()
+    if not tokens or not raw:
+        return True
+    if not _ECHO_MARKER_RE.search(raw):
+        return True
+    return _echo_start(raw, _keyword_names(tokens[0])) is not None
+
+
 def frame_reply(raw: str, command: str) -> str:
     """Start the reply at the console's echo of *command*.
 
@@ -104,14 +133,8 @@ def frame_reply(raw: str, command: str) -> str:
     tokens = command.split()
     if not tokens or not raw:
         return raw
-    wanted = _keyword_names(tokens[0])
-    for marker in _ECHO_MARKER_RE.finditer(raw):
-        line_end = raw.find("\n", marker.end())
-        echoed = _ANSI_RE.sub("", raw[marker.end(): line_end if line_end != -1 else None])
-        m = _ECHO_KEYWORD_RE.match(echoed)
-        if m and m.group(1).lower() in wanted:
-            return raw[marker.start():]
-    return raw
+    start = _echo_start(raw, _keyword_names(tokens[0]))
+    return raw[start:] if start is not None else raw
 
 
 class GMA2TelnetClient:
@@ -477,6 +500,11 @@ class GMA2TelnetClient:
             record_transport_warning("no reply from console within timeout")
         elif not ends_with_prompt(response):
             record_transport_warning("reply ended without a console prompt; it may be cut off")
+        if not echo_matches_command(response, command):
+            record_transport_warning(
+                f"console did not echo {command.split()[0]!r}; "
+                "it may have read the command as something else"
+            )
         return frame_reply(response, command)
 
     async def disconnect(self) -> None:
