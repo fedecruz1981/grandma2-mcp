@@ -798,34 +798,70 @@ async def plan_fixture_swap(
     """
     client = await _srv.get_client()
 
-    async def _get_type_attrs(type_name: str) -> set[str]:
-        """Discover attributes for a fixture type by navigating the cd tree."""
+    async def _get_type_attrs(type_name: str) -> tuple[set[str], str]:
+        """Discover attributes for a fixture type.
+
+        Returns (attributes, status) where status is one of:
+
+        * ``"ok"`` — the type was found and its attributes were read
+        * ``"not_found"`` — no fixture of that type is patched
+        * ``"unreadable"`` — a fixture matched but its info could not be read
+
+        The status is what keeps an empty attribute set from being read as "this
+        fixture type has no attributes".
+        """
         await client.send_command_with_response("cd /")
-        raw = await client.send_command_with_response("list fixture")
-        attrs: set[str] = set()
-        # Look for the fixture type in the listing
-        for line in raw.splitlines():
-            if type_name.lower() in line.lower():
-                # Try to get attribute info
+        try:
+            listing = await read_object(client, "fixture", None, echo_command="list fixture")
+            if not listing.found:
+                return set(), "not_found"
+
+            for line in listing.lines:
+                if type_name.lower() not in line.lower():
+                    continue
                 fixture_match = re.match(r"^\s*(\d+)\s", line.strip())
-                if fixture_match:
-                    fid = fixture_match.group(1)
-                    info = await client.send_command_with_response(f"info fixture {fid}")
-                    # Extract attribute names from info output
-                    for attr_match in re.finditer(r"(?:Attribute|Attr|Channel)\s*[=:]\s*(\w+)", info, re.IGNORECASE):
-                        attrs.add(attr_match.group(1))
-                    break
-        await client.send_command_with_response("cd /")
-        return attrs
+                if not fixture_match:
+                    continue
+                fid = fixture_match.group(1)
+                info = await read_object(client, "fixture", fid)
+                if not info.found or info.rejected:
+                    return set(), "unreadable"
+                attrs = {
+                    m.group(1)
+                    for m in re.finditer(
+                        r"(?:Attribute|Attr|Channel)\s*[=:]\s*(\w+)", info.raw, re.IGNORECASE
+                    )
+                }
+                # A fixture that answered but lists no attributes is a real
+                # answer; one that answered with nothing readable is not.
+                return attrs, "ok" if attrs else "unreadable"
+            return set(), "not_found"
+        finally:
+            await client.send_command_with_response("cd /")
 
-    old_attrs = await _get_type_attrs(old_fixture_type)
-    new_attrs = await _get_type_attrs(new_fixture_type)
+    old_attrs, old_status = await _get_type_attrs(old_fixture_type)
+    new_attrs, new_status = await _get_type_attrs(new_fixture_type)
 
-    if not old_attrs and not new_attrs:
+    if old_status != "ok" or new_status != "ok":
+        # One side unreadable used to fall through: the empty set became "the
+        # other type has none of these attributes", 0% compatible, risk high,
+        # and a migration plan built on nothing. There is nothing to plan
+        # against a fixture type we could not read.
         return json.dumps({
-            "error": "Could not discover attributes for either fixture type. Ensure both are patched.",
+            "error": (
+                "Could not read both fixture types, so there is no compatibility "
+                "to report. Fix the readable side first, then re-run."
+            ),
             "old_fixture_type": old_fixture_type,
+            "old_type_status": old_status,
             "new_fixture_type": new_fixture_type,
+            "new_type_status": new_status,
+            "hint": (
+                "Check the fixture type name against 'list fixture' output, and "
+                "that the type is actually patched."
+            ),
+            "risk_level": None,
+            "compatibility_percent": None,
             "risk_tier": "SAFE_READ",
         }, indent=2)
 
