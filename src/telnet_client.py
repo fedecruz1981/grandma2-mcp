@@ -105,6 +105,33 @@ def _echo_start(raw: str, wanted: frozenset[str]) -> int | None:
     return None
 
 
+def console_rejected(raw: str) -> tuple[bool, int | None, str]:
+    """Whether the console answered with an ``Error #N``.
+
+    The echo is not the signal. On a live 3.9.60.82 the console echoes an
+    unknown keyword verbatim and only then rejects it:
+
+        > NotAKeyword 1
+        Executing : NotAKeyword 1
+        Error : NotAKeyword 1
+        Error #1: UNKNOWN COMMAND
+
+    So ``echo_matches_command`` cannot tell a well-formed command from one the
+    console never understood — the echo looks the same either way. The rejection
+    line is the only thing that differs.
+
+    Returns ``(rejected, code, text)``.
+    """
+    match = _ERROR_RE.search(_ANSI_RE.sub("", raw or ""))
+    if match:
+        return True, int(match.group(1)), match.group(2).strip()
+    return False, None, ""
+
+
+# `Error #N: TEXT`, the console's rejection format.
+_ERROR_RE = re.compile(r"^\s*Error #(\d+)\s*:?\s*(.*)$", re.MULTILINE)
+
+
 def echo_matches_command(raw: str, command: str) -> bool:
     """True when the reply echoes *command*'s keyword, or echoes nothing at all.
 
@@ -500,7 +527,10 @@ class GMA2TelnetClient:
             record_transport_warning("no reply from console within timeout")
         elif not ends_with_prompt(response):
             record_transport_warning("reply ended without a console prompt; it may be cut off")
-        if not echo_matches_command(response, command):
+        rejected, code, text = console_rejected(response)
+        if rejected:
+            record_transport_warning(f"console rejected the command: Error #{code} {text}")
+        elif not echo_matches_command(response, command):
             record_transport_warning(
                 f"console did not echo {command.split()[0]!r}; "
                 "it may have read the command as something else"

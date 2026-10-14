@@ -124,6 +124,29 @@ class ObjectRead:
         return self.found and not self.rejected
 
 
+def asks_for_cue(raw: str, cue_ref: str) -> bool:
+    """True when a cue listing actually answered about *cue_ref*.
+
+    Verified live on 3.9.60.82 against show "inti y luna oct2026", sequence 156:
+
+        list cue 1    sequence 156  -> the row for cue 1
+        list cue 99   sequence 156  -> WARNING, NO OBJECTS FOUND
+        list cue abc  sequence 156  -> ALL SIX cue rows of the sequence
+        list cue -1   sequence 156  -> ALL SIX cue rows of the sequence
+
+    A non-numeric or negative cue number does not name a cue: the console falls
+    back to listing the whole sequence. The reply is well formed, it carries no
+    error, and it is not about the cue that was asked for. Any tool that decides
+    "the cue exists" from "no NO OBJECTS FOUND" therefore confirms a cue that
+    was never named — and reads back a row that belongs to some other cue.
+
+    The check is that the cue we asked for is among the cue numbers the listing
+    actually reports.
+    """
+    asked = cue_number(cue_ref)
+    return asked in object_ids_in(raw)
+
+
 def classify(raw: str, command: str = "") -> ObjectRead:
     """Turn a raw reply into an :class:`ObjectRead`.
 

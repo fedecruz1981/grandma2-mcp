@@ -10,7 +10,7 @@ import json
 
 import src.server as _srv
 from src.auth import OAuthScope, require_scope
-from src.cue_reads import cue_number, read_object
+from src.cue_reads import asks_for_cue, cue_number, read_object
 from src.server import (
     _get_sequence_for_executor,
     _handle_errors,
@@ -151,12 +151,22 @@ async def list_sequence_cues(
         ),
     )
 
+    # A cue read that came back "found" is not yet an answer about the cue asked
+    # for. Verified live: `list cue abc sequence 156` and `list cue -1 sequence
+    # 156` both return the whole sequence's rows — well formed, no error, and
+    # about every cue rather than one. So the cue we named has to appear in what
+    # came back before we call it present.
+    if cue_id is None:
+        exists = True
+    else:
+        exists = read.found and asks_for_cue(read.raw, cue_number(cue_id))
+
     result: dict = {
         "command_sent": read.command,
         "raw_response": read.raw,
         # Listing a whole sequence always answers; asking for one cue answers
         # about that cue, so only that case can report it missing.
-        "exists": read.found if cue_id is not None else True,
+        "exists": exists,
         "rejected": read.rejected,
         "resolved_sequence_id": resolved_sequence,
         "risk_tier": "SAFE_READ",
