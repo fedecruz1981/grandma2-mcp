@@ -214,6 +214,28 @@ async def list_cues(
     )
 
 
+# What a cue read can and cannot tell you. Verified live on 3.9.60.82 against
+# show "inti y luna oct2026", sequence 156, a cue with 749 stored values:
+#
+#   list cue 1 sequence 156        -> the cue's table row: trig, mode, loop, times
+#   cd Sequence 156 Cue 1 + list   -> the cue's card: name, delay, fade, snap
+#
+# Neither carries channel values. Nine command spellings were tried (list cue,
+# list preset, info, info attribute, pd, list pd, and the cd variants); none
+# return attribute values. The values live only in the sequence XML export:
+#
+#   <CueData><Channel fixture_id="1" attribute_name="DIM" /><Value>70</Value>
+#
+# So any tool that claims to compare cue *contents* over telnet is comparing
+# table rows. Tell the caller, rather than letting an empty attribute map read
+# as "these cues match on everything".
+CUE_READ_SEES_TABLE_ROW_ONLY = (
+    "Telnet cue reads return the cue's table row (trigger, mode, loop, times) "
+    "and its card (name, delay, fade, snap) — never its channel values. "
+    "Attribute values exist only in the sequence XML export. Any attribute-level "
+    "result below is derived from rows that do not carry attributes."
+)
+
 # A row of a pool listing. The console prefixes every row with the object type
 # ("Sequ", "Macro", "Cue", "Fixture", or the preset-type name), so the number is
 # the second token, not the first:

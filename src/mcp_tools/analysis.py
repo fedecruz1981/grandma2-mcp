@@ -18,6 +18,7 @@ from src.commands import (
     clear_all as build_clear_all,
 )
 from src.cue_reads import (
+    CUE_READ_SEES_TABLE_ROW_ONLY,
     cue_ids_in,
     cue_number,
     list_cues,
@@ -78,11 +79,8 @@ async def find_preset_usages(
     if snap and hasattr(snap, "sequences") and snap.sequences:
         seq_ids = [s.sequence_id for s in snap.sequences[:max_sequences] if hasattr(s, "sequence_id")]
     if not seq_ids:
-        raw = await client.send_command_with_response("list sequence")
-        for m in re.finditer(r"^\s*(\d+)\s", raw, re.MULTILINE):
-            seq_ids.append(int(m.group(1)))
-            if len(seq_ids) >= max_sequences:
-                break
+        seq_listing = await read_object(client, "sequence", None, echo_command="list sequence")
+        seq_ids = [int(i) for i in object_ids_in(seq_listing.raw, max_sequences)]
 
     # Scan each sequence's cues
     referencing_seqs: set[int] = set()
@@ -91,10 +89,13 @@ async def find_preset_usages(
         if not listing.found:
             continue
         if pattern.search(listing.raw):
-            # Find specific cue IDs
+            # Find specific cue IDs. The listing prefixes every row with "Cue",
+            # so the number is the second token.
             for line in listing.lines:
                 if pattern.search(line):
-                    cue_match = re.match(r"^\s*(\d+(?:\.\d+)?)\s", line.strip())
+                    cue_match = re.match(
+                        r"^\s*(?:\S+\s+)?(\d+(?:\.\d+)?)(?:\s|$)", line.strip()
+                    )
                     cue_id = cue_match.group(1) if cue_match else "unknown"
                     usages.append({
                         "sequence_id": seq_id,
@@ -240,6 +241,8 @@ async def diff_cues(
         "cue_a": cue_number(cue_a),
         "cue_b": cue_number(cue_b),
         "comparable": True,
+        "cue_read_contents": False,
+        "caveat": CUE_READ_SEES_TABLE_ROW_ONLY,
         "changes": changes,
         "total_changes": len(changes),
         "timing_diff": timing_diff,
@@ -584,12 +587,20 @@ async def detect_tracking_leaks(
     Compares adjacent cue pairs to find values that persist without an
     explicit Block. Tracking leaks cause unexpected looks in later cues.
 
+    IMPORTANT — what this can and cannot see: a telnet cue read returns the
+    cue's table row (trigger, mode, loop, times), not its channel values. Nine
+    command spellings were checked against a cue with 749 stored values; none
+    return attributes, which live only in the sequence XML export. So this
+    compares what the listing shows — trigger, mode and loop — and cannot see a
+    value that tracks forward. The result carries cue_read_contents=false so
+    that is never mistaken for a clean bill of health.
+
     Args:
         sequence_id: Sequence to analyze.
         max_cues: Max cues to compare (default 20).
 
     Returns:
-        str: JSON with leaks[], total_leaks, recommendation.
+        str: JSON with leaks[], total_leaks, recommendation, cue_read_contents.
     """
     client = await _srv.get_client()
 
@@ -665,6 +676,15 @@ async def detect_tracking_leaks(
     else:
         rec = "No tracking leaks detected."
 
+    # "No tracking leaks detected" is only ever true of what the listing shows.
+    # Over telnet that excludes every attribute value, which is the whole
+    # subject of the question, so the wording has to say so.
+    rec += (
+        f" NOTE: {CUE_READ_SEES_TABLE_ROW_ONLY} "
+        "A clean result here means the trigger/mode/loop rows match, not that "
+        "no attribute value tracks forward."
+    )
+
     return json.dumps({
         "sequence_id": sequence_id,
         "leaks": leaks[:50],
@@ -672,6 +692,8 @@ async def detect_tracking_leaks(
         "cues_checked": len(cue_ids),
         "cues_unreadable": unreadable,
         "complete": not unreadable,
+        "cue_read_contents": False,
+        "caveat": CUE_READ_SEES_TABLE_ROW_ONLY,
         "recommendation": rec,
         "risk_tier": "SAFE_READ",
     }, indent=2)
@@ -820,7 +842,11 @@ async def plan_fixture_swap(
             for line in listing.lines:
                 if type_name.lower() not in line.lower():
                     continue
-                fixture_match = re.match(r"^\s*(\d+)\s", line.strip())
+                # The listing prefixes rows with "Fixture", so the number is the
+                # second token.
+                fixture_match = re.match(
+                    r"^\s*(?:\S+\s+)?(\d+)(?:\s|$)", line.strip()
+                )
                 if not fixture_match:
                     continue
                 fid = fixture_match.group(1)
@@ -1006,6 +1032,13 @@ async def trace_attribute_lineage(
     candidate sequence/cue sources mentioning the attribute and, optionally,
     the target fixture.
 
+    IMPORTANT — what this can and cannot see: the cue text it scans is the
+    cue's table row and card, which never carry attribute values. A cue that
+    stores ColorRGB1 will not match here, because its listing does not name the
+    attribute. Treat a hit as "this cue's listing mentions the word", not as
+    "this cue stores the attribute"; for stored values, read the sequence XML
+    export. The result carries cue_read_contents=false.
+
     Args:
         attribute: Attribute name to search for (e.g. "Dimmer", "ColorRGB1").
         fixture_id: Optional fixture ID to narrow the lineage search.
@@ -1042,11 +1075,8 @@ async def trace_attribute_lineage(
     if not sequence_ids and snap and getattr(snap, "sequences", None):
         sequence_ids = [seq.id for seq in snap.sequences[:max_sequences] if hasattr(seq, "id")]
     if not sequence_ids:
-        raw = await client.send_command_with_response("list sequence")
-        for match in re.finditer(r"^\s*(\d+)\s", raw, re.MULTILINE):
-            sequence_ids.append(int(match.group(1)))
-            if len(sequence_ids) >= max_sequences:
-                break
+        seq_listing = await read_object(client, "sequence", None, echo_command="list sequence")
+        sequence_ids = [int(i) for i in object_ids_in(seq_listing.raw, max_sequences)]
 
     candidate_sources: list[dict] = []
     unreadable_sequences: list[dict] = []
@@ -1115,6 +1145,15 @@ async def trace_attribute_lineage(
             f"({', '.join(f'{s['sequence_id']}.{s['cue_id']}' for s in unreadable_sequences[:10])})."
         )
 
+    # The attribute scan runs over cue listings, which carry no attribute
+    # values. "No cue text matches" therefore says nothing about whether the
+    # attribute is stored anywhere — the search has nothing to match against.
+    summary += (
+        f" NOTE: {CUE_READ_SEES_TABLE_ROW_ONLY} "
+        f"An empty candidate_sources list means no cue LISTING mentions "
+        f"'{attribute}', not that no cue stores it."
+    )
+
     return json.dumps({
         "attribute": attribute,
         "fixture_id": fixture_id,
@@ -1122,6 +1161,8 @@ async def trace_attribute_lineage(
         "candidate_sources": candidate_sources,
         "unreadable_cues": unreadable_sequences,
         "complete": not unreadable_sequences,
+        "cue_read_contents": False,
+        "caveat": CUE_READ_SEES_TABLE_ROW_ONLY,
         "live_context": live_context,
         "summary": summary,
         "risk_tier": "SAFE_READ",
@@ -1442,8 +1483,12 @@ async def compare_patch_to_show_expectation(
                 "risk_tier": "SAFE_READ",
             }, indent=2)
 
-    raw = await (await _srv.get_client()).send_command_with_response("list fixture")
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    client = await _srv.get_client()
+    listing = await read_object(client, "fixture", None, echo_command="list fixture")
+    # Data lines only, and without the "Fixture N " row prefix: the expected
+    # fixture-type names must be matched against the type column, not against
+    # the fixture number.
+    lines = [line for line in listing.lines]
 
     normalized_expected = {
         fixture_type: re.sub(r"\s+", " ", fixture_type.strip().lower())
@@ -1457,8 +1502,11 @@ async def compare_patch_to_show_expectation(
     actual: dict[str, int] = {}
     unmatched_lines: list[str] = []
     for line in lines:
-        fixture_match = re.match(r"^\s*(\d+)\s+(.+?)\s*$", line)
-        candidate = fixture_match.group(2) if fixture_match else line
+        # A fixture row is "Fixture 12  Mac700 Profile  ...". The type is
+        # everything after the fixture number; the optional prefix keeps this
+        # working on a listing that starts with a bare number.
+        row_match = re.match(r"^\s*(?:\S+\s+)?\d+(?:\.\d+)?\s+(.+?)\s*$", line)
+        candidate = row_match.group(1) if row_match else line
         normalized_candidate = re.sub(r"\s+", " ", candidate.strip().lower())
         matched = False
         for fixture_type in expected_by_specificity:

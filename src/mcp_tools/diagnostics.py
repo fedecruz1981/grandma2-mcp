@@ -13,7 +13,13 @@ from src.auth import OAuthScope, require_scope
 from src.commands import (
     label as build_label,
 )
-from src.cue_reads import cue_ids_in, cue_number, list_cues, read_cue
+from src.cue_reads import (
+    CUE_READ_SEES_TABLE_ROW_ONLY,
+    cue_ids_in,
+    cue_number,
+    list_cues,
+    read_cue,
+)
 from src.server import (
     _handle_errors,
     mcp,
@@ -295,13 +301,20 @@ async def compare_cue_values(
     Lists both cues and diffs the raw console output to help identify
     what changes between them. Useful for tracking analysis and cue cleanup.
 
+    IMPORTANT — what this can and cannot see: a telnet cue read returns the
+    cue's table row (trigger, mode, loop, times), not its channel values.
+    Attribute values live only in the sequence XML export. So the differences
+    listed here are trigger/mode/loop differences between the two cues' rows,
+    not differences between what the cues actually store.
+
     Args:
         sequence_id: Sequence containing both cues.
         cue_a: First cue number.
         cue_b: Second cue number.
 
     Returns:
-        str: JSON with cue_a, cue_b, raw outputs, and line-by-line differences.
+        str: JSON with cue_a, cue_b, raw outputs, and line-by-line differences,
+        plus cue_read_contents=false and a caveat explaining the above.
     """
     client = await _srv.get_client()
 
@@ -349,6 +362,8 @@ async def compare_cue_values(
         "command_a": read_a.command,
         "command_b": read_b.command,
         "comparable": True,
+        "cue_read_contents": False,
+        "caveat": CUE_READ_SEES_TABLE_ROW_ONLY,
         "raw_a": raw_a,
         "raw_b": raw_b,
         "only_in_cue_a": only_in_a,
