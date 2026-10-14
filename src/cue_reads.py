@@ -217,15 +217,16 @@ async def list_cues(
 _CUE_ID_IN_LISTING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s", re.MULTILINE)
 
 
-def cue_ids_in(raw: str, limit: int) -> list[str]:
+def cue_ids_in(raw: str, limit: int | None = None) -> list[str]:
     """Cue numbers from a ``list cue sequence N`` reply, as the console spells them.
 
     Deduplicated in first-seen order so a listing that repeats a cue does not
-    make us read the same cue twice.
+    make us read the same cue twice. Pass ``limit`` to cap the result; the
+    default returns every cue in the listing.
     """
     seen: dict[str, None] = {}
     for m in _CUE_ID_IN_LISTING_RE.finditer(raw or ""):
         seen.setdefault(m.group(1), None)
-        if len(seen) >= limit:
+        if limit is not None and len(seen) >= limit:
             break
     return list(seen)

@@ -10,6 +10,7 @@ import json
 
 import src.server as _srv
 from src.auth import OAuthScope, require_scope
+from src.cue_reads import cue_number, read_object
 from src.server import (
     _get_sequence_for_executor,
     _handle_errors,
@@ -138,21 +139,33 @@ async def list_sequence_cues(
             "blocked": True,
         }, indent=2)
 
-    if cue_id is not None:
-        cmd = f"list cue {cue_id} sequence {resolved_sequence}"
-    else:
-        cmd = f"list cue sequence {resolved_sequence}"
-
-    raw = await client.send_command_with_response(cmd)
-    exists = "NO OBJECTS FOUND" not in raw.upper() if cue_id is not None else True
+    read = await read_object(
+        client,
+        "cue",
+        cue_id,
+        sequence=resolved_sequence,
+        echo_command=(
+            f"list cue {cue_number(cue_id)} sequence {resolved_sequence}"
+            if cue_id is not None
+            else f"list cue sequence {resolved_sequence}"
+        ),
+    )
 
     result: dict = {
-        "command_sent": cmd,
-        "raw_response": raw,
-        "exists": exists,
+        "command_sent": read.command,
+        "raw_response": read.raw,
+        # Listing a whole sequence always answers; asking for one cue answers
+        # about that cue, so only that case can report it missing.
+        "exists": read.found if cue_id is not None else True,
+        "rejected": read.rejected,
         "resolved_sequence_id": resolved_sequence,
         "risk_tier": "SAFE_READ",
     }
+    if read.rejected:
+        result["console_error"] = {
+            "code": read.error_code,
+            "text": read.error_text,
+        }
     if executor_probe_response is not None:
         result["executor_probe_response"] = executor_probe_response
 

@@ -8,6 +8,91 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+class TestCompareCueValuesMissing:
+    """Two cues the console has nothing for must not compare as identical.
+
+    Before the typed read, both "NO OBJECTS FOUND" replies went into a set
+    difference, produced nothing, and identical came back True.
+    """
+
+    NOT_FOUND = (
+        "Executing : \x1b[32mList\x1b[37m cue 3 sequence 1\n"
+        "\r\r WARNING, NO OBJECTS FOUND FOR LIST\n\r\r [Fixture]>\x1b[K"
+    )
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_both_missing(self, mock_get_client):
+        from src.server import compare_cue_values
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(return_value=self.NOT_FOUND)
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await compare_cue_values(sequence_id=1, cue_a=3, cue_b=4))
+
+        assert data["comparable"] is False
+        assert data["identical"] is None
+        assert len(data["cues_not_found"]) == 2
+        assert "nothing to compare" in data["error"]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_one_missing(self, mock_get_client):
+        from src.server import compare_cue_values
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(
+            side_effect=["Dimmer 100\nColor Red\n", self.NOT_FOUND]
+        )
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await compare_cue_values(sequence_id=1, cue_a=1, cue_b=9))
+
+        assert data["comparable"] is False
+        assert data["identical"] is None
+        assert len(data["cues_not_found"]) == 1
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_whole_cue_from_float_sends_no_decimal(self, mock_get_client):
+        from src.server import compare_cue_values
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(
+            side_effect=["Dimmer 100\n", "Dimmer 50\n"]
+        )
+        mock_get_client.return_value = mock_client
+
+        await compare_cue_values(sequence_id=156, cue_a=3.0, cue_b=4.0)
+
+        asked = [c.args[0] for c in mock_client.send_command_with_response.call_args_list]
+        assert asked == [
+            "list cue 3 sequence 156",
+            "list cue 4 sequence 156",
+        ]
+
+    @pytest.mark.asyncio
+    @patch("src.server.get_client")
+    async def test_echo_and_prompt_are_not_reported_as_differences(self, mock_get_client):
+        from src.server import compare_cue_values
+
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(
+            side_effect=[
+                "Executing : List cue 1 sequence 1\n\r\r Dimmer 100\n\r\r [Fixture]>",
+                "Executing : List cue 2 sequence 1\n\r\r Dimmer 100\n\r\r [Fixture]>",
+            ]
+        )
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await compare_cue_values(sequence_id=1, cue_a=1, cue_b=2))
+
+        assert data["identical"] is True
+        assert data["only_in_cue_a"] == []
+        assert data["only_in_cue_b"] == []
+
+
 class TestCompareCueValues:
     """Tests for the compare_cue_values MCP tool."""
 
@@ -27,8 +112,11 @@ class TestCompareCueValues:
 
         assert data["identical"] is True
         assert data["sequence_id"] == 1
-        assert data["cue_a"] == 1
-        assert data["cue_b"] == 2
+        # Echoed back as the console spells the cue, so a float 1.0 that reached
+        # the command never reaches the report.
+        assert data["cue_a"] == "1"
+        assert data["cue_b"] == "2"
+        assert data["comparable"] is True
         assert data["risk_tier"] == "SAFE_READ"
 
     @pytest.mark.asyncio

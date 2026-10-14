@@ -17,68 +17,16 @@ from src.auth import OAuthScope, require_scope
 from src.commands import (
     clear_all as build_clear_all,
 )
+from src.cue_reads import (
+    cue_ids_in,
+    cue_number,
+    list_cues,
+    read_cue,
+)
 from src.server import (
     _handle_errors,
     mcp,
 )
-
-# A cue number as grandMA2 writes it: "3" or "3.1", never "3.0". Parsing these
-# into a float and interpolating it back turns cue 3 into "list cue 3.0
-# sequence N", which names no cue; the console answers NO OBJECTS FOUND and the
-# caller reads that as "nothing to report" instead of "could not read".
-_CUE_ID_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s", re.MULTILINE)
-
-
-def _cue_ids_from_listing(raw: str, limit: int) -> list[str]:
-    """Cue numbers from a `list cue sequence N` reply, as the console spells them.
-
-    Deduplicated in first-seen order so a listing that repeats a cue does not
-    make us read the same cue twice.
-    """
-    seen: dict[str, None] = {}
-    for m in _CUE_ID_RE.finditer(raw):
-        seen.setdefault(m.group(1), None)
-        if len(seen) >= limit:
-            break
-    return list(seen)
-
-
-def _cue_not_found(raw: str) -> bool:
-    """True when the console had nothing for the cue that was asked for."""
-    return "NO OBJECTS" in raw.upper()
-
-
-def _cue_ref(value: int | float | str) -> str:
-    """A cue number as grandMA2 spells it.
-
-    Accepts the float that several tool signatures use so sub-cue numbers keep
-    their decimal (1.1) while whole cues lose the ".0" that float() adds.
-    """
-    if isinstance(value, str):
-        text = value.strip()
-    else:
-        number = float(value)
-        text = str(int(number)) if number.is_integer() else f"{number:g}"
-    return text or "1"
-
-
-# Lines the console emits around the reply that are not cue data: the echo of
-# our own command, the "NO OBJECTS FOUND" refusal, and errors. Parsing these
-# as attributes invents fields ("Executing", "NO") that look like real data.
-_ECHO_LINE_RE = re.compile(r"^\s*(Executing|No objects\b|error\b|Error\b)", re.IGNORECASE)
-
-# The console prompt the reply ends with, e.g. "[Fixture]>" or "[Channel]>".
-_PROMPT_ONLY_RE = re.compile(r"^\s*[\[\w][^\r\n]*>\s*$")
-
-
-def _is_prompt_line(line: str) -> bool:
-    """True for a line that is only the console's prompt.
-
-    Kept local rather than imported: this module is imported *by* src.server,
-    so pulling in src.telnet_client at module level would close an import cycle.
-    """
-    return bool(_PROMPT_ONLY_RE.match(line))
-
 
 # ============================================================
 # Analysis & Intelligence Tools
@@ -137,10 +85,12 @@ async def find_preset_usages(
     # Scan each sequence's cues
     referencing_seqs: set[int] = set()
     for seq_id in seq_ids:
-        raw = await client.send_command_with_response(f"list cue sequence {seq_id}")
-        if pattern.search(raw):
+        listing = await list_cues(client, seq_id)
+        if not listing.found:
+            continue
+        if pattern.search(listing.raw):
             # Find specific cue IDs
-            for line in raw.splitlines():
+            for line in listing.lines:
                 if pattern.search(line):
                     cue_match = re.match(r"^\s*(\d+(?:\.\d+)?)\s", line.strip())
                     cue_id = cue_match.group(1) if cue_match else "unknown"
@@ -203,20 +153,20 @@ async def diff_cues(
         nothing.
     """
     client = await _srv.get_client()
-    ref_a, ref_b = _cue_ref(cue_a), _cue_ref(cue_b)
-    raw_a = await client.send_command_with_response(f"list cue {ref_a} sequence {sequence_id}")
-    raw_b = await client.send_command_with_response(f"list cue {ref_b} sequence {sequence_id}")
+    read_a = await read_cue(client, sequence_id, cue_a)
+    read_b = await read_cue(client, sequence_id, cue_b)
+    raw_a, raw_b = read_a.raw, read_b.raw
 
-    missing: list[str] = []
-    if _cue_not_found(raw_a):
-        missing.append(ref_a)
-    if _cue_not_found(raw_b):
-        missing.append(ref_b)
+    missing = [
+        cue_number(c)
+        for c, r in ((cue_a, read_a), (cue_b, read_b))
+        if not r.found
+    ]
     if missing:
         return json.dumps({
             "sequence_id": sequence_id,
-            "cue_a": ref_a,
-            "cue_b": ref_b,
+            "cue_a": cue_number(cue_a),
+            "cue_b": cue_number(cue_b),
             "comparable": False,
             "cues_not_found": missing,
             "error": (
@@ -230,17 +180,15 @@ async def diff_cues(
             "risk_tier": "SAFE_READ",
         }, indent=2)
 
-    def _parse_cue_attrs(raw: str) -> dict[str, str]:
-        """Parse attribute=value pairs from cue listing.
+    def _parse_cue_attrs(read) -> dict[str, str]:
+        """Parse attribute=value pairs from a cue listing.
 
-        Skips the console's own lines (the command echo, refusal, errors):
-        read as a column they would invent attributes called "Executing".
+        :func:`read.lines` already has the console's chrome removed — the
+        command echo, the refusal, the prompt. Read as a row, the echo would
+        invent an attribute called "Executing".
         """
         attrs: dict[str, str] = {}
-        for line in raw.strip().splitlines():
-            line = line.strip()
-            if not line or _ECHO_LINE_RE.match(line):
-                continue
+        for line in read.lines:
             # Try KEY=VALUE or tabular format
             kv = re.findall(r"(\w+)\s*=\s*(\S+)", line)
             for k, v in kv:
@@ -251,8 +199,8 @@ async def diff_cues(
                 attrs[cols[0]] = " ".join(cols[1:])
         return attrs
 
-    attrs_a = _parse_cue_attrs(raw_a)
-    attrs_b = _parse_cue_attrs(raw_b)
+    attrs_a = _parse_cue_attrs(read_a)
+    attrs_b = _parse_cue_attrs(read_b)
     all_keys = sorted(set(attrs_a.keys()) | set(attrs_b.keys()))
 
     changes: list[dict] = []
@@ -282,20 +230,13 @@ async def diff_cues(
 
     # Fallback raw diff, from the cue data only — the command echo and the
     # prompt differ between two reads of the same cue and would show up here.
-    def _data_lines(raw: str) -> set[str]:
-        return {
-            ln.strip() for ln in raw.strip().splitlines()
-            if ln.strip() and not _ECHO_LINE_RE.match(ln.strip())
-            and not _is_prompt_line(ln.strip())
-        }
-
-    lines_a = _data_lines(raw_a)
-    lines_b = _data_lines(raw_b)
+    lines_a = set(read_a.lines)
+    lines_b = set(read_b.lines)
 
     return json.dumps({
         "sequence_id": sequence_id,
-        "cue_a": ref_a,
-        "cue_b": ref_b,
+        "cue_a": cue_number(cue_a),
+        "cue_b": cue_number(cue_b),
         "comparable": True,
         "changes": changes,
         "total_changes": len(changes),
@@ -651,11 +592,11 @@ async def detect_tracking_leaks(
     client = await _srv.get_client()
 
     # Get cue list
-    raw = await client.send_command_with_response(f"list cue sequence {sequence_id}")
-    if "NO OBJECTS" in raw.upper():
+    listing = await list_cues(client, sequence_id)
+    if not listing.found:
         return json.dumps({"error": f"Sequence {sequence_id} not found.", "risk_tier": "SAFE_READ"}, indent=2)
 
-    cue_ids: list[str] = _cue_ids_from_listing(raw, max_cues)
+    cue_ids: list[str] = cue_ids_in(listing.raw, max_cues)
 
     if len(cue_ids) < 2:
         return json.dumps({
@@ -671,36 +612,26 @@ async def detect_tracking_leaks(
     leaks: list[dict] = []
     unreadable: list[dict] = []
 
-    def _readable(text: str) -> bool:
-        """False when the console had nothing for that cue.
-
-        An unreadable cue must not be compared: intersecting its "NO OBJECTS
-        FOUND" against the previous cue finds nothing, which reads as a clean
-        pair instead of a missing reading.
-        """
-        return "NO OBJECTS" not in text.upper()
-
-    prev_raw = await client.send_command_with_response(f"list cue {cue_ids[0]} sequence {sequence_id}")
-    prev_ok = _readable(prev_raw)
+    prev = await read_cue(client, sequence_id, cue_ids[0])
+    prev_ok = prev.found
     if not prev_ok:
         unreadable.append({"cue_id": cue_ids[0]})
 
     for i in range(1, len(cue_ids)):
-        curr_raw = await client.send_command_with_response(f"list cue {cue_ids[i]} sequence {sequence_id}")
-        curr_ok = _readable(curr_raw)
+        curr = await read_cue(client, sequence_id, cue_ids[i])
+        curr_ok = curr.found
         if not curr_ok:
             unreadable.append({"cue_id": cue_ids[i]})
 
         # A pair only counts when both sides answered. When the previous cue
         # could not be read, this one has no partner to compare against.
         if prev_ok and curr_ok:
-            prev_vals = set(prev_raw.strip().splitlines())
-            curr_vals = set(curr_raw.strip().splitlines())
-            shared = prev_vals & curr_vals
+            # Data lines only: the command echo and the prompt are chrome and
+            # would otherwise show up as a value shared by both cues.
+            shared = set(prev.lines) & set(curr.lines)
 
             # Lines that appear identical in both cues AND contain attribute data
             for line in shared:
-                line = line.strip()
                 if re.match(r"^\s*\w+\s+\d", line) and "block" not in line.lower():
                     attr_match = re.match(r"^\s*(\w+)", line)
                     if attr_match:
@@ -708,11 +639,11 @@ async def detect_tracking_leaks(
                             "cue_from": cue_ids[i - 1],
                             "cue_to": cue_ids[i],
                             "attribute": attr_match.group(1),
-                            "value": line.strip()[:100],
+                            "value": line[:100],
                             "note": "Value identical in adjacent cues — may be tracking forward without explicit set",
                         })
 
-        prev_raw, prev_ok = curr_raw, curr_ok
+        prev, prev_ok = curr, curr_ok
         await asyncio.sleep(0.05)
 
     unreadable_ids = ", ".join(str(c["cue_id"]) for c in unreadable)
@@ -1080,19 +1011,29 @@ async def trace_attribute_lineage(
                 break
 
     candidate_sources: list[dict] = []
+    unreadable_sequences: list[dict] = []
     for seq_id in sequence_ids:
-        cue_list = await client.send_command_with_response(f"list cue sequence {seq_id}")
-        cue_ids: list[str] = _cue_ids_from_listing(cue_list, max_cues_per_sequence)
+        listing = await list_cues(client, seq_id)
+        cue_ids: list[str] = cue_ids_in(listing.raw, max_cues_per_sequence)
 
         for cue_id in cue_ids:
-            cue_raw = await client.send_command_with_response(f"list cue {cue_id} sequence {seq_id}")
+            cue_read = await read_cue(client, seq_id, cue_id)
+            if not cue_read.found:
+                # Nothing to search: the cue is absent or unreadable. Counting
+                # it as "no attribute mentions here" would make this tool
+                # report a clean lineage over a gap in what it read.
+                unreadable_sequences.append({
+                    "sequence_id": seq_id,
+                    "cue_id": cue_id,
+                })
+                continue
             matched_lines = []
-            for line in cue_raw.splitlines():
+            for line in cue_read.lines:
                 if not attr_re.search(line):
                     continue
                 if fixture_re and not fixture_re.search(line):
                     continue
-                matched_lines.append(line.strip()[:200])
+                matched_lines.append(line[:200])
 
             if matched_lines:
                 candidate_sources.append({
@@ -1127,12 +1068,22 @@ async def trace_attribute_lineage(
             f"No cue text matches found for attribute '{attribute}'. "
             "Inspect live programmer, parks, world/filter state, and active executors."
         )
+    if unreadable_sequences:
+        # Without this, "no cue mentions this attribute" reads as the whole
+        # show having been searched, when some cues never answered.
+        summary += (
+            f" NOTE: {len(unreadable_sequences)} cue(s) could not be read and were "
+            f"skipped; this result does not cover them "
+            f"({', '.join(f'{s['sequence_id']}.{s['cue_id']}' for s in unreadable_sequences[:10])})."
+        )
 
     return json.dumps({
         "attribute": attribute,
         "fixture_id": fixture_id,
         "inspected_sequences": sequence_ids,
         "candidate_sources": candidate_sources,
+        "unreadable_cues": unreadable_sequences,
+        "complete": not unreadable_sequences,
         "live_context": live_context,
         "summary": summary,
         "risk_tier": "SAFE_READ",

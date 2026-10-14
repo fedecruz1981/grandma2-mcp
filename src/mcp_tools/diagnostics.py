@@ -13,6 +13,7 @@ from src.auth import OAuthScope, require_scope
 from src.commands import (
     label as build_label,
 )
+from src.cue_reads import cue_ids_in, cue_number, list_cues, read_cue
 from src.server import (
     _handle_errors,
     mcp,
@@ -227,25 +228,21 @@ async def auto_number_cues(
     client = await _srv.get_client()
 
     # List existing cues
-    list_cmd = f"list cue sequence {sequence_id}"
-    raw = await client.send_command_with_response(list_cmd)
-    if "NO OBJECTS FOUND" in raw.upper():
+    listing = await list_cues(client, sequence_id)
+    raw = listing.raw
+    if not listing.found:
         return json.dumps({
             "error": f"Sequence {sequence_id} has no cues.",
-            "command_sent": list_cmd,
+            "command_sent": listing.command,
             "raw_response": raw,
             "risk_tier": "DESTRUCTIVE",
             "blocked": True,
         }, indent=2)
 
-    # Parse cue IDs from the raw list output (look for numeric IDs in first column)
-    import re
-    cue_ids: list[float] = []
-    for line in raw.splitlines():
-        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s", line.strip())
-        if m:
-            cue_ids.append(float(m.group(1)))
-
+    # Cue IDs as the console spells them ("3", "1.1"). Sorted numerically so cue
+    # 10 lands after cue 9 rather than between 1 and 2, and formatted through
+    # cue_number so a whole cue is never renumbered as "cue 3.0".
+    cue_ids = sorted(cue_ids_in(raw), key=float)
     if not cue_ids:
         return json.dumps({
             "error": "Could not parse cue IDs from sequence listing.",
@@ -259,17 +256,20 @@ async def auto_number_cues(
     commands: list[str] = []
     new_num = start
     mapping = []
-    for old_id in sorted(cue_ids):
+    for old_id in cue_ids:  # already sorted numerically
         mapping.append((old_id, new_num))
         new_num += spacing
 
     # Move cues in reverse order to avoid overwriting
     for old_id, new_id in reversed(mapping):
-        if old_id != new_id:
-            cmd = f"move cue {old_id} sequence {sequence_id} at cue {new_id} sequence {sequence_id}"
+        if float(old_id) != new_id:
+            cmd = (
+                f"move cue {cue_number(old_id)} sequence {sequence_id} "
+                f"at cue {cue_number(new_id)} sequence {sequence_id}"
+            )
             await client.send_command_with_response(cmd)
             commands.append(cmd)
-        old_to_new[str(old_id)] = str(new_id)
+        old_to_new[cue_number(old_id)] = str(new_id)
 
     return json.dumps({
         "cues_renumbered": len(old_to_new),
@@ -305,23 +305,50 @@ async def compare_cue_values(
     """
     client = await _srv.get_client()
 
-    cmd_a = f"list cue {cue_a} sequence {sequence_id}"
-    cmd_b = f"list cue {cue_b} sequence {sequence_id}"
-    raw_a = await client.send_command_with_response(cmd_a)
-    raw_b = await client.send_command_with_response(cmd_b)
+    read_a = await read_cue(client, sequence_id, cue_a)
+    read_b = await read_cue(client, sequence_id, cue_b)
+    raw_a, raw_b = read_a.raw, read_b.raw
 
-    # Line-by-line diff
-    lines_a = set(raw_a.strip().splitlines())
-    lines_b = set(raw_b.strip().splitlines())
+    missing = [
+        cue_number(c)
+        for c, r in ((cue_a, read_a), (cue_b, read_b))
+        if not r.found
+    ]
+    if missing:
+        return json.dumps({
+            "sequence_id": sequence_id,
+            "cue_a": cue_number(cue_a),
+            "cue_b": cue_number(cue_b),
+            "command_a": read_a.command,
+            "command_b": read_b.command,
+            "comparable": False,
+            "cues_not_found": missing,
+            "error": (
+                "One or both cues were not found; there is nothing to compare. "
+                "Two NO OBJECTS replies are byte-identical, so diffing them would "
+                "report the cues as identical."
+            ),
+            "hint": "Use list_sequence_cues(sequence_id) to see the available cues.",
+            "identical": None,
+            "raw_a": raw_a,
+            "raw_b": raw_b,
+            "risk_tier": "SAFE_READ",
+        }, indent=2)
+
+    # Line-by-line diff over data lines only: the command echo and the prompt
+    # differ between two reads and would otherwise show up as differences.
+    lines_a = set(read_a.lines)
+    lines_b = set(read_b.lines)
     only_in_a = sorted(lines_a - lines_b)
     only_in_b = sorted(lines_b - lines_a)
 
     return json.dumps({
         "sequence_id": sequence_id,
-        "cue_a": cue_a,
-        "cue_b": cue_b,
-        "command_a": cmd_a,
-        "command_b": cmd_b,
+        "cue_a": cue_number(cue_a),
+        "cue_b": cue_number(cue_b),
+        "command_a": read_a.command,
+        "command_b": read_b.command,
+        "comparable": True,
         "raw_a": raw_a,
         "raw_b": raw_b,
         "only_in_cue_a": only_in_a,

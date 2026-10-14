@@ -263,7 +263,7 @@ class TestDetectTrackingLeaks:
         assert "error" in data
 
 
-class TestCueIdsFromListing:
+class TestCueIdsInListing:
     """Cue numbers must keep the spelling grandMA2 uses.
 
     Parse them into a float and interpolate back, and cue 3 becomes
@@ -271,35 +271,35 @@ class TestCueIdsFromListing:
     """
 
     def test_keeps_integers_without_a_decimal(self):
-        from src.mcp_tools.analysis import _cue_ids_from_listing
+        from src.cue_reads import cue_ids_in
 
-        assert _cue_ids_from_listing("1  A\n2  B\n3  C\n", 10) == ["1", "2", "3"]
+        assert cue_ids_in("1  A\n2  B\n3  C\n", 10) == ["1", "2", "3"]
 
     def test_no_float_ever_appears_in_the_listing(self):
-        from src.mcp_tools.analysis import _cue_ids_from_listing
+        from src.cue_reads import cue_ids_in
 
-        ids = _cue_ids_from_listing("1  A\n2  B\n3  C\n4  D\n", 10)
+        ids = cue_ids_in("1  A\n2  B\n3  C\n4  D\n", 10)
         assert not any("." in i for i in ids), ids
 
     def test_keeps_sub_cues_as_the_console_spells_them(self):
-        from src.mcp_tools.analysis import _cue_ids_from_listing
+        from src.cue_reads import cue_ids_in
 
-        assert _cue_ids_from_listing("1  A\n1.1  B\n2  C\n", 10) == ["1", "1.1", "2"]
+        assert cue_ids_in("1  A\n1.1  B\n2  C\n", 10) == ["1", "1.1", "2"]
 
     def test_respects_the_limit(self):
-        from src.mcp_tools.analysis import _cue_ids_from_listing
+        from src.cue_reads import cue_ids_in
 
-        assert _cue_ids_from_listing("1 A\n2 B\n3 C\n4 D\n", 2) == ["1", "2"]
+        assert cue_ids_in("1 A\n2 B\n3 C\n4 D\n", 2) == ["1", "2"]
 
     def test_deduplicates(self):
-        from src.mcp_tools.analysis import _cue_ids_from_listing
+        from src.cue_reads import cue_ids_in
 
-        assert _cue_ids_from_listing("1 A\n1 A again\n2 B\n", 10) == ["1", "2"]
+        assert cue_ids_in("1 A\n1 A again\n2 B\n", 10) == ["1", "2"]
 
     def test_empty_listing(self):
-        from src.mcp_tools.analysis import _cue_ids_from_listing
+        from src.cue_reads import cue_ids_in
 
-        assert _cue_ids_from_listing("NO OBJECTS FOUND", 10) == []
+        assert cue_ids_in("NO OBJECTS FOUND", 10) == []
 
 
 class TestDetectTrackingLeaksCueNumbers:
@@ -344,6 +344,69 @@ class TestDetectTrackingLeaksCueNumbers:
             if "list cue " in cmd and "sequence" in cmd:
                 number = cmd.split("list cue ")[1].split(" sequence")[0]
                 assert number == number.rstrip("0").rstrip("."), cmd
+
+
+def _snapshot_with_sequence_one():
+    snap = MagicMock()
+    snap.executor_state = {201: MagicMock(sequence_id=1)}
+    snap.selected_fixture_count = 0
+    snap.active_filter = None
+    snap.active_world = None
+    snap.console_modes = {}
+    snap.selected_exec = "1.201"
+    snap.selected_exec_cue = "1"
+    return snap
+
+
+class TestTraceAttributeLineageUnreadable:
+    """A cue the console cannot name must not be counted as searched.
+
+    The tool reports which cues mention an attribute. A cue that answered
+    nothing was never searched, so the result has to say so.
+    """
+
+    @pytest.mark.asyncio
+    @patch("src.server._orchestrator")
+    @patch("src.server.get_client")
+    async def test_unreadable_cue_is_listed_and_result_marked_incomplete(
+        self, mock_get_client, mock_orch
+    ):
+        from src.server import trace_attribute_lineage
+
+        mock_orch.last_snapshot = _snapshot_with_sequence_one()
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1 Cue1\n2 Cue2\n",          # cues of sequence 1
+            "Fixture 101 Dimmer 100\n",  # cue 1: mentions the attribute
+            "NO OBJECTS FOUND",         # cue 2: unreadable
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await trace_attribute_lineage(attribute="Dimmer"))
+
+        assert data["unreadable_cues"] == [{"sequence_id": 1, "cue_id": "2"}]
+        assert data["complete"] is False
+        assert "could not be read" in data["summary"]
+
+    @pytest.mark.asyncio
+    @patch("src.server._orchestrator")
+    @patch("src.server.get_client")
+    async def test_all_readable_means_complete(self, mock_get_client, mock_orch):
+        from src.server import trace_attribute_lineage
+
+        mock_orch.last_snapshot = _snapshot_with_sequence_one()
+        mock_client = MagicMock()
+        mock_client.send_command_with_response = AsyncMock(side_effect=[
+            "1 Cue1\n2 Cue2\n",
+            "Fixture 101 Dimmer 100\n",
+            "Fixture 101 Dimmer 50\n",
+        ])
+        mock_get_client.return_value = mock_client
+
+        data = json.loads(await trace_attribute_lineage(attribute="Dimmer"))
+
+        assert data["complete"] is True
+        assert data["unreadable_cues"] == []
 
 
 class TestDetectTrackingLeaksUnreadable:
@@ -433,57 +496,33 @@ class TestDetectTrackingLeaksUnreadable:
         assert [leak["cue_to"] for leak in data["leaks"]] == ["3"]
 
 
-class TestCueRefFormatting:
-    """Whole cue numbers must not acquire the ".0" that float() adds."""
-
-    def test_int_stays_int(self):
-        from src.mcp_tools.analysis import _cue_ref
-
-        assert _cue_ref(3) == "3"
-
-    def test_float_that_is_whole_loses_the_decimal(self):
-        from src.mcp_tools.analysis import _cue_ref
-
-        assert _cue_ref(3.0) == "3"
-        assert _cue_ref(12.0) == "12"
-
-    def test_sub_cue_keeps_its_decimal(self):
-        from src.mcp_tools.analysis import _cue_ref
-
-        assert _cue_ref(1.1) == "1.1"
-
-    def test_accepts_a_string_as_given(self):
-        from src.mcp_tools.analysis import _cue_ref
-
-        assert _cue_ref("1.1") == "1.1"
-        assert _cue_ref("7") == "7"
-
-
 class TestReplyLineFilters:
-    def test_command_echo_is_not_cue_data(self):
-        from src.mcp_tools.analysis import _ECHO_LINE_RE
+    """Console chrome must not be parsed as cue data.
 
-        assert _ECHO_LINE_RE.match("Executing : List cue 3 sequence 1")
-        assert _ECHO_LINE_RE.match("NO OBJECTS FOUND")
+    These now live in src.cue_reads and are covered in detail by
+    tests/test_cue_reads.py; what is checked here is that the helper the
+    analysis tools reach for keeps behaving.
+    """
+
+    def test_command_echo_is_not_cue_data(self):
+        from src.cue_reads import strip_chrome
+
+        assert strip_chrome(
+            "Executing : List cue 3 sequence 1\n\r\r Dimmer 100\n\r\r [Fixture]>"
+        ) == ["Dimmer 100"]
 
     def test_real_cue_data_survives(self):
-        from src.mcp_tools.analysis import _ECHO_LINE_RE
+        from src.cue_reads import strip_chrome
 
-        assert not _ECHO_LINE_RE.match("Dimmer 100")
-        assert not _ECHO_LINE_RE.match("  Dimmer 50")
-        assert not _ECHO_LINE_RE.match("Pan 128")
+        assert strip_chrome("Dimmer 100\n  Dimmer 50\nPan 128") == [
+            "Dimmer 100", "Dimmer 50", "Pan 128",
+        ]
 
-    def test_prompt_lines_are_recognised(self):
-        from src.mcp_tools.analysis import _is_prompt_line
+    def test_prompt_lines_are_not_data(self):
+        from src.cue_reads import strip_chrome
 
-        assert _is_prompt_line("[Fixture]>") is True
-        assert _is_prompt_line("[Channel]>") is True
-        assert _is_prompt_line("Macro>") is True
-
-    def test_data_is_not_mistaken_for_a_prompt(self):
-        from src.mcp_tools.analysis import _is_prompt_line
-
-        assert _is_prompt_line("Dimmer 100") is False
+        assert strip_chrome("[Fixture]>\n[Channel]>") == []
+        assert strip_chrome("[Fixture]>\x1b[K\nDimmer 1") == ["Dimmer 1"]
 
 
 class TestDiffCuesMissingCues:

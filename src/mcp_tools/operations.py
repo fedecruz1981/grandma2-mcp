@@ -11,6 +11,7 @@ from pathlib import Path
 
 import src.server as _srv
 from src.auth import OAuthScope, require_scope
+from src.cue_reads import list_cues, strip_chrome
 from src.server import (
     _handle_errors,
     mcp,
@@ -783,9 +784,8 @@ async def validate_preset_references(sequence_id: int, sample_cues: int = 5) -> 
     import re as _re
     client = await _srv.get_client()
 
-    cue_list_raw = await client.send_command_with_response(f"List Cue Sequence {sequence_id}")
-    cue_lines = [ln.strip() for ln in cue_list_raw.splitlines() if ln.strip() and ln[0].isdigit()]
-
+    read = await list_cues(client, sequence_id)
+    cue_lines = read.lines
     if sample_cues > 0:
         cue_lines = cue_lines[:sample_cues]
 
@@ -800,7 +800,7 @@ async def validate_preset_references(sequence_id: int, sample_cues: int = 5) -> 
 
         cue_info = await client.send_command_with_response(f"Info Cue {cue_id} Sequence {sequence_id}")
 
-        for info_line in cue_info.splitlines():
+        for info_line in strip_chrome(cue_info):
             if "Preset" in info_line and "." in info_line:
                 preset_match = _re.search(r"Preset\s+(\d+)\.(\d+)", info_line)
                 if preset_match:
