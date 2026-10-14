@@ -214,15 +214,29 @@ async def list_cues(
     )
 
 
-_CUE_ID_IN_LISTING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s", re.MULTILINE)
+# A row of a pool listing. The console prefixes every row with the object type
+# ("Sequ", "Macro", "Cue", "Fixture", or the preset-type name), so the number is
+# the second token, not the first:
+#
+#     Sequ   1 1    DIMER BEAM     ...
+#     Macro 1 1    Stomp Position ...
+#     Cue 1 1       *    Go ...
+#     Beam 5.1 5.1  SN FROST ...
+#
+# The prefix is optional so replies that list a bare number ("1  A") still work.
+# A header row starts with a word ("Number", "No.", "LibraryName") and therefore
+# has no number to match.
+_CUE_ID_IN_LISTING_RE = re.compile(r"^\s*(?:\S+\s+)?(\d+(?:\.\d+)?)(?:\s|$)", re.MULTILINE)
 
 
-def cue_ids_in(raw: str, limit: int | None = None) -> list[str]:
-    """Cue numbers from a ``list cue sequence N`` reply, as the console spells them.
+def object_ids_in(raw: str, limit: int | None = None) -> list[str]:
+    """Object numbers from a pool listing, in the order the console lists them.
 
-    Deduplicated in first-seen order so a listing that repeats a cue does not
-    make us read the same cue twice. Pass ``limit`` to cap the result; the
-    default returns every cue in the listing.
+    Handles the type prefix the console puts on every row ("Sequ 1", "Cue 1",
+    "Macro 1") as well as a bare number. Deduplicated in first-seen order.
+
+    Deduplication matters for sequences: the listing repeats the number in a
+    second column (the MIB), and a naive read can pick up both.
     """
     seen: dict[str, None] = {}
     for m in _CUE_ID_IN_LISTING_RE.finditer(raw or ""):
@@ -230,3 +244,12 @@ def cue_ids_in(raw: str, limit: int | None = None) -> list[str]:
         if limit is not None and len(seen) >= limit:
             break
     return list(seen)
+
+
+def cue_ids_in(raw: str, limit: int | None = None) -> list[str]:
+    """Cue numbers from a ``list cue sequence N`` reply, as the console spells them.
+
+    See :func:`object_ids_in` — same parser, named for the cue pool because
+    that is where the decimal form ("3.1") appears.
+    """
+    return object_ids_in(raw, limit)

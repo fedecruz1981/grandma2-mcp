@@ -21,6 +21,7 @@ from src.cue_reads import (
     cue_ids_in,
     cue_number,
     list_cues,
+    object_ids_in,
     read_cue,
     read_object,
 )
@@ -1251,13 +1252,7 @@ async def find_unused_objects(
 
     if object_type == "sequence":
         listing = await read_object(client, "sequence", None, echo_command="list sequence")
-        seq_ids: list[int] = []
-        for line in listing.lines:
-            match = re.match(r"^\s*(\d+)\s*(.*)$", line)
-            if match:
-                seq_ids.append(int(match.group(1)))
-            if len(seq_ids) >= max_objects:
-                break
+        seq_ids = [int(i) for i in object_ids_in(listing.raw, max_objects)]
         assigned = {
             state.sequence_id
             for state in ((getattr(snap, "executor_state", {}) or {}).values() if snap else [])
@@ -1273,15 +1268,7 @@ async def find_unused_objects(
 
     elif object_type == "macro":
         listing = await read_object(client, "macro", None, echo_command="list macro")
-        macro_ids: list[int] = []
-        for line in listing.lines:
-            match = re.match(r"^\s*(\d+)\s", line)
-            if match:
-                macro_ids.append(int(match.group(1)))
-            if len(macro_ids) >= max_objects:
-                break
-            if len(macro_ids) >= max_objects:
-                break
+        macro_ids = [int(i) for i in object_ids_in(listing.raw, max_objects)]
 
         referenced: set[int] = set()
         active_macros = set(getattr(snap, "active_macros", []) or []) if snap else set()
