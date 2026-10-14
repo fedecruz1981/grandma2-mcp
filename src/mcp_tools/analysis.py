@@ -22,6 +22,7 @@ from src.cue_reads import (
     cue_number,
     list_cues,
     read_cue,
+    read_object,
 )
 from src.server import (
     _handle_errors,
@@ -1210,11 +1211,15 @@ async def find_unused_objects(
     candidate_unused: list[dict] = []
     inspected = 0
 
+    unreadable: list[int] = []
+
     if object_type == "sequence":
-        raw = await client.send_command_with_response("list sequence")
+        listing = await read_object(client, "sequence", None, echo_command="list sequence")
         seq_ids: list[int] = []
-        for match in re.finditer(r"^\s*(\d+)\s*(.*)$", raw, re.MULTILINE):
-            seq_ids.append(int(match.group(1)))
+        for line in listing.lines:
+            match = re.match(r"^\s*(\d+)\s*(.*)$", line)
+            if match:
+                seq_ids.append(int(match.group(1)))
             if len(seq_ids) >= max_objects:
                 break
         assigned = {
@@ -1231,23 +1236,39 @@ async def find_unused_objects(
                 })
 
     elif object_type == "macro":
-        raw = await client.send_command_with_response("list macro")
+        listing = await read_object(client, "macro", None, echo_command="list macro")
         macro_ids: list[int] = []
-        for match in re.finditer(r"^\s*(\d+)\s", raw, re.MULTILINE):
-            macro_ids.append(int(match.group(1)))
+        for line in listing.lines:
+            match = re.match(r"^\s*(\d+)\s", line)
+            if match:
+                macro_ids.append(int(match.group(1)))
+            if len(macro_ids) >= max_objects:
+                break
             if len(macro_ids) >= max_objects:
                 break
 
         referenced: set[int] = set()
         active_macros = set(getattr(snap, "active_macros", []) or []) if snap else set()
+        # A macro whose body could not be read has no known inbound references.
+        # Listing it as unused would recommend deleting a macro that may well be
+        # referenced, so unreadable bodies are held back from the candidates.
+        unreadable: list[int] = []
+        bodies: dict[int, str] = {}
         for macro_id in macro_ids:
-            body = await client.send_command_with_response(f"list macro {macro_id}")
+            read = await read_object(client, "macro", macro_id)
             inspected += 1
-            for ref in re.finditer(r"\bGo\s+Macro\s+(\d+)\b", body, re.IGNORECASE):
+            if not read.found or read.rejected or not read.lines:
+                unreadable.append(macro_id)
+                await asyncio.sleep(0.01)
+                continue
+            bodies[macro_id] = read.raw
+            for ref in re.finditer(r"\bGo\s+Macro\s+(\d+)\b", read.raw, re.IGNORECASE):
                 referenced.add(int(ref.group(1)))
             await asyncio.sleep(0.01)
 
         for macro_id in macro_ids:
+            if macro_id in unreadable:
+                continue
             if macro_id not in referenced and macro_id not in active_macros:
                 candidate_unused.append({
                     "id": macro_id,
@@ -1277,16 +1298,27 @@ async def find_unused_objects(
                 })
             await asyncio.sleep(0.01)
 
+    notes = [
+        "This tool returns candidates, not authoritative deletion approval.",
+        "Hydrate console state first for stronger sequence/macro signal.",
+    ]
+    unreadable_out: list[dict] = []
+    if object_type == "macro" and unreadable:
+        unreadable_out = [{"id": m} for m in unreadable]
+        notes.append(
+            f"{len(unreadable)} macro(s) could not be read and are excluded from "
+            "the candidates; this list does not speak for them."
+        )
+
     return json.dumps({
         "object_type": object_type,
         "preset_type": preset_type,
         "inspected": inspected,
         "candidate_unused": candidate_unused,
+        "unreadable_objects": unreadable_out,
+        "complete": not unreadable_out,
         "heuristic_only": True,
-        "notes": [
-            "This tool returns candidates, not authoritative deletion approval.",
-            "Hydrate console state first for stronger sequence/macro signal.",
-        ],
+        "notes": notes,
         "risk_tier": "SAFE_READ",
     }, indent=2)
 
