@@ -1,7 +1,13 @@
-"""Los parsers del repo contra listings REALES de la consola.
+r"""Los parsers del repo contra listings REALES de la consola.
 
-Escribí los tests con respuestas inventadas. Ahora que hay consola puedo
-capturar las de verdad y ver si los parsers las entienden.
+Los tests de este repo se escribieron con respuestas inventadas. Con la consola
+disponible, capturo las de verdad y veo si los parsers las entienden.
+
+Resultado: la consola antepone el tipo a cada fila ("Sequ", "Macro", "Cue",
+"Fixture"), así que el patrón `^\s*(\d+)\s` no matchea ninguna. Ver
+doc/CUE-READS-ES.md §11.
+
+Solo lectura: solo envía `list`.
 """
 
 import asyncio
@@ -30,7 +36,7 @@ async def main():
     await c.connect()
 
     print("=" * 74)
-    print("A — FORMATO REAL de 'list sequence'")
+    print("A â€” FORMATO REAL de 'list sequence'")
     print("=" * 74)
     r = await c.cmd("list sequence")
     for ln in r.body[:4]:
@@ -43,7 +49,7 @@ async def main():
 
     print()
     print("=" * 74)
-    print("B — FORMATO REAL de 'list macro'")
+    print("B â€” FORMATO REAL de 'list macro'")
     print("=" * 74)
     r = await c.cmd("list macro")
     for ln in r.body[:5]:
@@ -55,7 +61,7 @@ async def main():
 
     print()
     print("=" * 74)
-    print("C — FORMATO REAL de 'list preset 1' (pool)")
+    print("C â€” FORMATO REAL de 'list preset 1' (pool)")
     print("=" * 74)
     r = await c.cmd("list preset 1")
     for ln in r.body[:6]:
@@ -66,7 +72,7 @@ async def main():
 
     print()
     print("=" * 74)
-    print("D — strip_chrome sobre una respuesta REAL con datos")
+    print("D â€” strip_chrome sobre una respuesta REAL con datos")
     print("=" * 74)
     r = await c.cmd("list cue 1 sequence 156")
     print("  crudo:")

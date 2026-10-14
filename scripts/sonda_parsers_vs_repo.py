@@ -1,6 +1,13 @@
 """Los parsers del REPO contra respuestas REALES de la consola.
 
-Todo esto corre el código real del repo, no una reimplementación.
+Corre el código real del repo — `cue_ids_in`, `detect_tracking_leaks`,
+`find_unused_objects` — con las respuestas reales de la consola. Así se vio que
+esos tres devolvían 0 sobre un show con 165 secuencias y 6 macros, porque el
+parser no matcheaba ni una fila. Ver doc/CUE-READS-ES.md §11.
+
+Para regenerar el resultado tras cambiar los parsers.
+
+Solo lectura: solo envía `list`.
 """
 
 import asyncio
@@ -14,6 +21,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 
 from ma2_telnet import Ma2  # noqa: E402
+
 from src.cue_reads import cue_ids_in  # noqa: E402
 
 
@@ -47,7 +55,7 @@ async def main():
     print("respuestas reales capturadas\n")
 
     print("=" * 74)
-    print("1 — cue_ids_in() sobre un listado REAL de cues")
+    print("1 â€” cue_ids_in() sobre un listado REAL de cues")
     print("=" * 74)
     real = r["list cue sequence 156"]
     print("  crudo:")
@@ -55,11 +63,11 @@ async def main():
         if ln.strip():
             print(f"    |{ln.strip()[:90]}")
     print(f"\n  cue_ids_in(real) = {cue_ids_in(real, 10)}")
-    print(f"  (mis tests usaban '1  Cue1\\n2  Cue2' que SI matchea el patron)")
+    print("  (mis tests usaban '1  Cue1\\n2  Cue2' que SI matchea el patron)")
 
     print()
     print("=" * 74)
-    print("2 — detect_tracking_leaks con la respuesta REAL")
+    print("2 â€” detect_tracking_leaks con la respuesta REAL")
     print("=" * 74)
     import src.server as srv
 
@@ -71,7 +79,7 @@ async def main():
 
     print()
     print("=" * 74)
-    print("3 — find_unused_objects(sequence) con la respuesta REAL")
+    print("3 â€” find_unused_objects(sequence) con la respuesta REAL")
     print("=" * 74)
 
     class Snap:
@@ -85,13 +93,13 @@ async def main():
         out = json.loads(await srv.find_unused_objects(object_type="sequence"))
     print(f"  inspected        : {out['inspected']}")
     print(f"  candidate_unused : {len(out['candidate_unused'])}")
-    print(f"  (el show tiene 165 secuencias)")
+    print("  (el show tiene 165 secuencias)")
     if out["candidate_unused"]:
         print(f"  primeros: {out['candidate_unused'][:3]}")
 
     print()
     print("=" * 74)
-    print("4 — find_unused_objects(macro) con la respuesta REAL")
+    print("4 â€” find_unused_objects(macro) con la respuesta REAL")
     print("=" * 74)
     with patch.object(srv, "get_client", return_value=mock(r)), patch.object(
         srv, "_orchestrator", MagicMock(last_snapshot=Snap())
@@ -105,7 +113,7 @@ async def main():
 
     print()
     print("=" * 74)
-    print("5 — ¿qué prefijos usa la consola? (muestra de cada listing)")
+    print("5 â€” Â¿quÃ© prefijos usa la consola? (muestra de cada listing)")
     print("=" * 74)
     import re
     for clave in ("list sequence", "list macro", "list fixture", "list cue sequence 156"):

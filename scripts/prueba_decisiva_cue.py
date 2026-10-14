@@ -1,3 +1,16 @@
+"""¿El `.0` de un número de cue rompe el comando?
+
+Compara byte a byte el mismo cue escrito de las dos formas, en una secuencia
+donde ese cue existe. Antes de esto solo se comparaba el largo de la respuesta,
+que no distingue nada.
+
+Respuesta (3.9.60.82, show "inti y luna oct2026"): los 2 caracteres de
+diferencia están solo en la línea del eco; el cuerpo de datos es idéntico. La
+consola normaliza `1.0` a `1`. Ver doc/CUE-READS-ES.md §10.1.
+
+Solo lectura: envía `list` y navega el árbol cd, no escribe nada en el show.
+"""
+
 import asyncio
 import re
 import sys

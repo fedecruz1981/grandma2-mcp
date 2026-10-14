@@ -1,13 +1,19 @@
 """Qué devuelve realmente `list cue N sequence M`.
 
-El refactor asume que el cuerpo de la respuesta contiene los DATOS del cue.
-La primera sonda en vivo showed que las tres secuencias devuelven texto
-idéntico para el cue 1 — y solo tres campos de reproducción, sin valores de
-canal. Antes de dar por buena esa premisa, hay que ver un cue que sí tenga
-contenido.
+El refactor de lecturas asumía que el cuerpo de la respuesta contiene los datos
+del cue. La primera sonda en vivo mostró que las tres secuencias devuelven
+texto idéntico para el cue 1 — y solo campos de reproducción (trigger, modo,
+loop, tiempos), sin valores de canal. Antes de dar por buena esa premisa hay
+que ver un cue que sí tenga contenido.
+
+Respuesta (3.9.60.82, "inti y luna oct2026"): `list cue` no trae valores.
+Ver doc/CUE-READS-ES.md §10.2.
+
+Solo lectura: envía `list` e `info`, navega el árbol cd. No escribe en el show.
 """
 
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -20,7 +26,7 @@ async def main() -> None:
     await c.connect()
 
     print("=" * 72)
-    print("1 — ¿QUÉ SHOW ESTÁ ABIERTO?")
+    print("1 â€” Â¿QUÃ‰ SHOW ESTÃ ABIERTO?")
     print("=" * 72)
     r = await c.cmd("ListVar")
     for linea in r.body:
@@ -30,7 +36,7 @@ async def main() -> None:
 
     print()
     print("=" * 72)
-    print("2 — ¿CUÁNTOS CUES POR SECUENCIA? (156 a 161)")
+    print("2 â€” Â¿CUÃNTOS CUES POR SECUENCIA? (156 a 161)")
     print("=" * 72)
     for seq in (156, 157, 158, 159, 160, 161):
         r = await c.cmd(f"list cue sequence {seq}")
@@ -39,7 +45,7 @@ async def main() -> None:
 
     print()
     print("=" * 72)
-    print("3 — ¿QUÉ DEVUELVE UN CUE CON CONTENIDO? (sequence 161, todos los cues)")
+    print("3 â€” Â¿QUÃ‰ DEVUELVE UN CUE CON CONTENIDO? (sequence 161, todos los cues)")
     print("=" * 72)
     r = await c.cmd("list cue sequence 161")
     ids = []
@@ -48,10 +54,8 @@ async def main() -> None:
         if s.startswith("Cue "):
             partes = s.split()
             if len(partes) > 1:
-                try:
+                with contextlib.suppress(ValueError):
                     ids.append(float(partes[1]))
-                except ValueError:
-                    pass
     print(f"  cues en la 161: {[int(i) if i.is_integer() else i for i in ids]}")
     for cue in ids:
         rr = await c.cmd(f"list cue {int(cue) if cue.is_integer() else cue} sequence 161")
@@ -61,7 +65,7 @@ async def main() -> None:
 
     print()
     print("=" * 72)
-    print("4 — ALTERNATIVA: cd al cue y list. ¿Devuelve los valores?")
+    print("4 â€” ALTERNATIVA: cd al cue y list. Â¿Devuelve los valores?")
     print("=" * 72)
     if ids:
         objetivo = int(ids[0]) if ids[0].is_integer() else ids[0]
@@ -77,7 +81,7 @@ async def main() -> None:
 
     print()
     print("=" * 72)
-    print("5 — ¿Y CON pd/attribute sobre el cue?")
+    print("5 â€” Â¿Y CON pd/attribute sobre el cue?")
     print("=" * 72)
     for cmd in ("list attribute", "cd Sequence 161", "list"):
         rr = await c.cmd(cmd)
@@ -86,7 +90,7 @@ async def main() -> None:
             print(f"      {ln.rstrip()}")
 
     await c.close()
-    print("\n  (el cd quedó en Sequence 161; bajá a / en la consola si hace falta)")
+    print("\n  (el cd quedÃ³ en Sequence 161; bajÃ¡ a / en la consola si hace falta)")
 
 
 asyncio.run(main())
